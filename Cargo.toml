@@ -1,7 +1,7 @@
 [package]
 name = "ic3-cli"
 description = "A command line for Microsoft Teams chat, for agents: send messages and stream events as JSON. Unofficial; built on ic3-teams."
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"

@@ -29,6 +29,8 @@ ic3 send '<id>' 'deploy *finished*'
 echo 'from stdin' | ic3 send '<id>' -   # stdin must be a pipe or file, not a terminal
 ic3 send '<id>' 'literal *stars*' --plain
 ic3 send '<id>' 'hi' --json    # prints the receipt
+ic3 typing '<id>' &            # show "typing…" until the next `ic3 send` there
+ic3 typing '<id>' --for 90s    # give up after 90 seconds (default 5m)
 ic3 listen                     # every conversation
 ic3 listen '<id1>,<id2>' '<id3>'
 ```
@@ -69,6 +71,27 @@ prints:
 ```
 
 `arrived_at` is left out when Teams did not return one.
+
+### `typing`
+
+Teams has no typing state to switch on and off. A client sends a signal into the chat, which the
+others see as "… is typing" for about 25 seconds, and repeats it every 20 seconds to keep the
+indicator on. Nothing is sent to stop it: the indicator expires, or clears as soon as the sender's
+next message arrives.
+
+`ic3 typing <id>` sends the signal at once and then every 20 seconds. Start it in the background
+when an agent's turn begins, and post when the turn ends:
+
+```sh
+ic3 typing '<id>' &
+# ...the agent works...
+ic3 send '<id>' 'the reply'
+```
+
+`ic3 send` to the same conversation stops it before posting, so no typing signal follows the
+message. It also stops on SIGINT or SIGTERM, when another `ic3 typing` starts for the same
+conversation, or after `--for` (default 5 minutes), so a crashed agent can't leave people watching
+"typing…" for ever. It prints nothing, and exits 0 when stopped or 2 if not signed in.
 
 ### `listen`
 
