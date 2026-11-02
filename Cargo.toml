@@ -1,0 +1,36 @@
+[package]
+name = "ic3-cli"
+description = "A command line for Microsoft Teams chat, for agents: send messages and stream events as JSON. Unofficial; built on ic3-teams."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "ic3"
+path = "src/main.rs"
+
+[dependencies]
+ic3-teams = { git = "https://github.com/Jezza/ic3", rev = "a625a3fbfaee5d2b32fcb259a51db54ec6118e04" }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "time"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+async-trait = "0.1"
+directories = "6.0"
+anyhow = "1.0"
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
