@@ -8,23 +8,30 @@ mod store;
 use std::collections::HashSet;
 use std::future::Future;
 use std::io::{IsTerminal, Read, Write};
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use clap::{Parser, Subcommand};
 use ic3_teams::format::parse_slack;
 use ic3_teams::logging::{RedactingMakeWriter, filter_directives};
+use ic3_teams::redact::redact_text;
 use ic3_teams::{Client, ConversationId, Event, RichText, TokenStore};
+use tokio::io::{AsyncWriteExt, Interest};
+use tokio::net::unix::pipe;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
 use crate::output::{EventLine, ReceiptJson};
-use crate::store::LockedStore;
+use crate::store::{LockedStore, Status};
 
 /// Exit code for "not signed in, or the session expired".
 const EXIT_SIGNED_OUT: u8 = 2;
+/// How often `listen` checks whether someone signed in again or out.
+const STATUS_EVERY: Duration = Duration::from_secs(30);
 
 /// Microsoft Teams chat for agents: send messages and stream events as JSON.
 ///
@@ -59,7 +66,7 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Forget the stored session
+    /// Forget the stored session (running `ic3 listen`s stop with exit code 2)
     Logout,
     /// List every chat and channel: `id<TAB>kind<TAB>name`, most recent first
     List {
@@ -71,7 +78,7 @@ enum Cmd {
     Send {
         /// The conversation id
         id: String,
-        /// The message; `-` reads it from stdin
+        /// The message; `-` reads it from stdin (which must be a pipe or file)
         message: String,
         /// Send the text literally, without *bold* / _italic_ / `code` formatting
         #[arg(long)]
@@ -120,7 +127,8 @@ async fn main() -> ExitCode {
             ExitCode::from(EXIT_SIGNED_OUT)
         }
         Err(e) => {
-            eprintln!("ic3: {e:#}");
+            // Error text can quote response bodies: redact it like the log.
+            eprintln!("ic3: {}", redact_text(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     }
@@ -151,22 +159,24 @@ fn default_session_path() -> anyhow::Result<PathBuf> {
 /// The session file and how to build clients on it.
 #[derive(Debug)]
 struct Session {
+    path: PathBuf,
     store: Arc<LockedStore>,
     tenant: String,
 }
 
 impl Session {
-    fn client(&self) -> anyhow::Result<Client> {
-        let store: Arc<dyn TokenStore> = self.store.clone();
+    fn client_on(&self, store: Arc<LockedStore>) -> anyhow::Result<Client> {
+        let store: Arc<dyn TokenStore> = store;
         Ok(Client::builder()
             .tenant(&self.tenant)
             .token_store_arc(store)
             .build()?)
     }
 
-    /// A client on the stored session; [`SignedOut`] without one.
+    /// A fresh client on the stored session; [`SignedOut`] without one.
     async fn signed_in_client(&self) -> anyhow::Result<Client> {
-        let client = self.client()?;
+        self.store.reset().await;
+        let client = self.client_on(self.store.clone())?;
         if client.needs_login().await? {
             return Err(SignedOut.into());
         }
@@ -175,7 +185,8 @@ impl Session {
 
     /// Runs `op` on a signed-in client. If the session is refused but
     /// another `ic3` process has saved a newer one meanwhile, runs it once
-    /// more on a client built from that.
+    /// more on a client built from that. A refused session fails before
+    /// anything is posted, so the retry cannot double-send.
     async fn with_client<T, F, Fut>(&self, op: F) -> anyhow::Result<T>
     where
         F: Fn(Client) -> Fut,
@@ -203,14 +214,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None => default_session_path()?,
     };
     let session = Session {
-        store: Arc::new(LockedStore::new(path)),
+        store: Arc::new(LockedStore::new(&path)),
+        path,
         tenant: cli.tenant,
     };
     match cli.command {
         Cmd::Login { force } => login(&session, force).await,
         Cmd::Logout => {
-            session.store.force_clear().await?;
-            eprintln!("signed out ({})", session.store.path().display());
+            session.store.sign_out().await?;
+            eprintln!("signed out ({})", session.path.display());
             Ok(())
         }
         Cmd::List { json } => {
@@ -240,22 +252,27 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 async fn login(session: &Session, force: bool) -> anyhow::Result<()> {
-    let client = session.client()?;
-    if !force && !client.needs_login().await? {
-        match client.me().await {
-            Ok(me) => {
-                eprintln!("already signed in as {}", me.display_name);
-                client.shutdown().await;
-                return Ok(());
+    if !force {
+        let client = session.client_on(session.store.clone())?;
+        let signed_in = if client.needs_login().await? {
+            None
+        } else {
+            match client.me().await {
+                Ok(me) => Some(me),
+                // Expired: sign in afresh below.
+                Err(ic3_teams::Error::ReauthRequired) => None,
+                Err(e) => return Err(e).context("checking the stored session"),
             }
-            Err(ic3_teams::Error::ReauthRequired) => {
-                // Expired: sign in afresh below, on a new client.
-            }
-            Err(e) => return Err(e).context("checking the stored session"),
+        };
+        client.shutdown().await;
+        if let Some(me) = signed_in {
+            eprintln!("already signed in as {}", me.display_name);
+            return Ok(());
         }
     }
-    client.shutdown().await;
-    let client = session.client()?;
+    // The device flow's save is a new sign-in: running `ic3` processes on
+    // the old one stop saving it and reconnect with this one.
+    let client = session.client_on(Arc::new(LockedStore::for_sign_in(&session.path)))?;
     let login = client
         .start_device_login()
         .await
@@ -276,8 +293,12 @@ async fn login(session: &Session, force: bool) -> anyhow::Result<()> {
 /// dropped; empty is an error.
 fn message_text(arg: String) -> anyhow::Result<String> {
     let text = if arg == "-" {
+        let mut stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            bail!("`-` reads the message from stdin, but stdin is a terminal; pipe the message in");
+        }
         let mut s = String::new();
-        std::io::stdin()
+        stdin
             .read_to_string(&mut s)
             .context("reading the message from stdin")?;
         s
@@ -338,22 +359,104 @@ fn parse_ids(args: &[String]) -> HashSet<String> {
         .collect()
 }
 
-/// How one push connection ended.
+/// Why one push connection ended.
+#[derive(Debug, PartialEq)]
 enum Ended {
-    /// Killed: exit cleanly.
-    Signal,
-    /// The session was refused.
+    /// The session was refused, or signed out.
     SignedOut,
+    /// Someone signed in again: reconnect with the new session.
+    Replaced,
     /// stdout was closed: nobody is reading.
     StdoutClosed,
 }
 
+/// `listen`'s stdout. A pipe (the usual case) is written without blocking a
+/// thread, so a signal can always interrupt a write to a reader that stopped
+/// reading, and is watched for its reader closing.
+#[derive(Debug)]
+enum Stdout {
+    Pipe(pipe::Sender),
+    /// A file or terminal.
+    Other(tokio::sync::Mutex<tokio::io::Stdout>),
+}
+
+impl Stdout {
+    fn new() -> Stdout {
+        match std::io::stdout().as_fd().try_clone_to_owned() {
+            Ok(fd) => Stdout::from_fd(fd),
+            Err(_) => Stdout::Other(tokio::sync::Mutex::new(tokio::io::stdout())),
+        }
+    }
+
+    /// A pipe sender when `fd` is a pipe, else plain stdout.
+    fn from_fd(fd: OwnedFd) -> Stdout {
+        match pipe::Sender::from_owned_fd(fd) {
+            Ok(s) => Stdout::Pipe(s),
+            Err(_) => Stdout::Other(tokio::sync::Mutex::new(tokio::io::stdout())),
+        }
+    }
+
+    async fn write_all(&self, mut buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            Stdout::Pipe(s) => {
+                while !buf.is_empty() {
+                    s.writable().await?;
+                    match s.try_write(buf) {
+                        Ok(n) => buf = &buf[n..],
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            }
+            Stdout::Other(out) => {
+                let mut out = out.lock().await;
+                out.write_all(buf).await?;
+                out.flush().await
+            }
+        }
+    }
+
+    /// Resolves once the reader of a pipe has gone; never for a file or
+    /// terminal.
+    async fn closed(&self) {
+        if let Stdout::Pipe(s) = self
+            && s.ready(Interest::ERROR).await.is_ok()
+        {
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn listen(session: &Session, ids: &[String]) -> anyhow::Result<()> {
     let filter = parse_ids(ids);
+    // Installed once, up front, so no signal is lost between connections.
+    let mut sigint = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+    let out = Stdout::new();
+    let result = tokio::select! {
+        r = listen_loop(session, &filter, &out) => r,
+        _ = sigint.recv() => Ok(()),
+        _ = sigterm.recv() => Ok(()),
+        () = out.closed() => Ok(()),
+    };
+    match result {
+        // Leave without waiting on the runtime: a write to a terminal or file
+        // may still be in flight on a blocking thread.
+        Ok(()) => std::process::exit(0),
+        Err(e) => Err(e),
+    }
+}
+
+async fn listen_loop(
+    session: &Session,
+    filter: &HashSet<String>,
+    out: &Stdout,
+) -> anyhow::Result<()> {
     loop {
         let client = session.signed_in_client().await?;
-        let ended = match listen_once(&client, &filter, &mut sigterm).await {
+        let ended = match listen_once(session, &client, filter, out).await {
             Ok(ended) => ended,
             Err(e) if is_signed_out(&e) => Ended::SignedOut,
             Err(e) => {
@@ -363,7 +466,8 @@ async fn listen(session: &Session, ids: &[String]) -> anyhow::Result<()> {
         };
         client.shutdown().await;
         match ended {
-            Ended::Signal | Ended::StdoutClosed => return Ok(()),
+            Ended::StdoutClosed => return Ok(()),
+            Ended::Replaced => tracing::info!("signed in again; reconnecting with the new session"),
             Ended::SignedOut if session.store.changed().await? => {
                 tracing::info!("session replaced by another ic3 process; reconnecting with it");
             }
@@ -373,17 +477,23 @@ async fn listen(session: &Session, ids: &[String]) -> anyhow::Result<()> {
 }
 
 async fn listen_once(
+    session: &Session,
     client: &Client,
     filter: &HashSet<String>,
-    sigterm: &mut tokio::signal::unix::Signal,
+    out: &Stdout,
 ) -> anyhow::Result<Ended> {
     let me = client.me().await?.mri;
     let mut events = client.connect().await.context("connecting to Teams")?;
+    let mut check = tokio::time::interval(STATUS_EVERY);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let ev = tokio::select! {
             ev = events.recv() => ev,
-            _ = tokio::signal::ctrl_c() => return Ok(Ended::Signal),
-            _ = sigterm.recv() => return Ok(Ended::Signal),
+            _ = check.tick() => match session.store.status().await? {
+                Status::Current => continue,
+                Status::Replaced => return Ok(Ended::Replaced),
+                Status::SignedOut => return Ok(Ended::SignedOut),
+            },
         };
         let Some(ev) = ev else {
             bail!("the push connection stopped");
@@ -392,7 +502,7 @@ async fn listen_once(
             if !filter.is_empty() && !filter.contains(line.conversation()) {
                 continue;
             }
-            if !print_line(&line)? {
+            if !write_line(out, &line).await? {
                 return Ok(Ended::StdoutClosed);
             }
             continue;
@@ -414,11 +524,11 @@ async fn listen_once(
     }
 }
 
-/// Writes one JSON line and flushes; `false` when stdout is closed.
-fn print_line(line: &EventLine) -> anyhow::Result<bool> {
-    let json = serde_json::to_string(line)?;
-    let mut out = std::io::stdout().lock();
-    match writeln!(out, "{json}").and_then(|()| out.flush()) {
+/// Writes one JSON line; `false` when the reader has gone.
+async fn write_line(out: &Stdout, line: &EventLine) -> anyhow::Result<bool> {
+    let mut json = serde_json::to_string(line)?;
+    json.push('\n');
+    match out.write_all(json.as_bytes()).await {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
         Err(e) => Err(e).context("writing to stdout"),
@@ -468,5 +578,73 @@ mod tests {
         Cli::command().debug_assert();
         let cli = Cli::try_parse_from(["ic3", "send", "48:notes", "-", "--plain"]).unwrap();
         assert!(matches!(cli.command, Cmd::Send { plain: true, .. }));
+    }
+
+    fn delete_line() -> EventLine {
+        EventLine::Delete {
+            conversation: "c".into(),
+            id: "1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pipe_stdout_notices_the_reader_going() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let out = Arc::new(Stdout::from_fd(OwnedFd::from(writer)));
+        assert!(matches!(*out, Stdout::Pipe(_)));
+        let watch = tokio::spawn({
+            let out = out.clone();
+            async move { out.closed().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!watch.is_finished(), "resolved while the reader was open");
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(2), watch)
+            .await
+            .expect("did not notice the reader closing")
+            .unwrap();
+        assert!(!write_line(&out, &delete_line()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pipe_stdout_writes_lines() {
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let out = Stdout::from_fd(OwnedFd::from(writer));
+        assert!(write_line(&out, &delete_line()).await.unwrap());
+        drop(out);
+        let mut got = String::new();
+        reader.read_to_string(&mut got).unwrap();
+        assert_eq!(
+            got,
+            "{\"type\":\"delete\",\"conversation\":\"c\",\"id\":\"1\"}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_reader_does_not_block_cancellation() {
+        let (_reader, writer) = std::io::pipe().unwrap();
+        let out = Stdout::from_fd(OwnedFd::from(writer));
+        let big = vec![b'x'; 1 << 20];
+        let r = tokio::time::timeout(Duration::from_millis(200), out.write_all(&big)).await;
+        assert!(
+            r.is_err(),
+            "a write to a full pipe should wait, and be cancellable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_regular_file_is_not_a_pipe() {
+        let file = tempfile::tempfile().unwrap();
+        let out = Stdout::from_fd(OwnedFd::from(file));
+        assert!(matches!(out, Stdout::Other(_)));
+        let r = tokio::time::timeout(Duration::from_millis(100), out.closed()).await;
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn error_lines_are_redacted() {
+        let e = anyhow!("http 400: {{\"refresh_token\":\"0.AXoA-secret\"}}");
+        let printed = redact_text(&format!("{e:#}"));
+        assert!(!printed.contains("0.AXoA-secret"), "{printed}");
     }
 }
