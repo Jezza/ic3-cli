@@ -875,7 +875,8 @@ dependencies = [
 [[package]]
 name = "ic3-teams"
 version = "0.1.0"
-source = "git+https://github.com/Jezza/ic3?rev=a625a3fbfaee5d2b32fcb259a51db54ec6118e04#a625a3fbfaee5d2b32fcb259a51db54ec6118e04"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39446602f22d582eaf699154460ae44a584ab1a7e526ef488f6a9676898a767b"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

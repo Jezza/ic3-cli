@@ -5,14 +5,18 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
-publish = false
+repository = "https://github.com/Jezza/ic3-cli"
+readme = "README.md"
+keywords = ["teams", "microsoft-teams", "chat", "cli", "agents"]
+categories = ["command-line-utilities"]
+include = ["src/**/*.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [[bin]]
 name = "ic3"
 path = "src/main.rs"
 
 [dependencies]
-ic3-teams = { git = "https://github.com/Jezza/ic3", rev = "a625a3fbfaee5d2b32fcb259a51db54ec6118e04" }
+ic3-teams = "0.1.0"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "time", "io-std", "io-util", "net"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }

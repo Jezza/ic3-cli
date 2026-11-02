@@ -12,8 +12,10 @@ Linux only.
 ## Install
 
 ```sh
-cargo install --path .
+cargo install ic3-cli
 ```
+
+This installs the `ic3` binary. Building needs Rust 1.98 or newer.
 
 ## Commands
 
@@ -117,3 +119,8 @@ one back, about hourly. Three sibling files and rules keep that safe:
 6. Leave `listen` running for over an hour, which spans a token renewal, then repeat step 5.
 7. With `listen` running, `ic3 logout`. Within 30 seconds `listen` exits with code 2, and the session
    file stays gone after the next hourly renewal would have happened.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT)
+at your option.
