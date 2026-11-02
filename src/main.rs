@@ -4,6 +4,7 @@
 mod list;
 mod output;
 mod store;
+mod typing;
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -74,7 +75,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Send a message to a conversation id (from `ic3 list`)
+    /// Send a message to a conversation id (from `ic3 list`); stops `ic3 typing` there first
     Send {
         /// The conversation id
         id: String,
@@ -86,6 +87,36 @@ enum Cmd {
         /// Print the receipt as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Show "typing…" in a conversation until you post there
+    ///
+    /// How Teams typing works: there is no typing state to switch on and off. A client
+    /// shows it is typing by sending a signal into the chat, which the others see as
+    /// "… is typing" for about 25 seconds. To keep the indicator on, it repeats the
+    /// signal every 20 seconds. Nothing is sent to stop it: the indicator ends when the
+    /// signals stop and it expires, or as soon as the sender's next message arrives.
+    ///
+    /// `ic3 typing <id>` sends the signal at once and then every 20 seconds. Run it in
+    /// the background when an agent's turn starts, and post when the turn ends:
+    ///
+    ///     ic3 typing '<id>' &
+    ///     ...the agent works...
+    ///     ic3 send '<id>' 'the reply'
+    ///
+    /// `ic3 send` to the same conversation stops it before posting, so no typing signal
+    /// follows the message, and the message itself clears the indicator for everyone.
+    /// It also stops on SIGINT or SIGTERM, when another `ic3 typing` starts for the same
+    /// conversation, or after --for, so a crashed agent can't leave people watching
+    /// "typing…" for ever.
+    ///
+    /// Prints nothing. Exits 0 when stopped, 2 if not signed in.
+    #[command(verbatim_doc_comment)]
+    Typing {
+        /// The conversation id
+        id: String,
+        /// Stop after this long at most: 90s, 5m, 1h
+        #[arg(long = "for", value_name = "DURATION", default_value = "5m", value_parser = typing::parse_duration)]
+        max: Duration,
     },
     /// Stream new, edited and deleted messages as JSON lines until killed
     Listen {
@@ -248,6 +279,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             json,
         } => send(&session, id, message, plain, json).await,
         Cmd::Listen { ids } => listen(&session, &ids).await,
+        Cmd::Typing { id, max } => typing(&session, id, max).await,
     }
 }
 
@@ -333,6 +365,7 @@ async fn send(
     }
     let conv = ConversationId(id);
     let body = body(&message_text(message)?, plain);
+    stop_typing(session, &conv).await;
     let receipt = session
         .with_client(|c| {
             let (conv, body) = (conv.clone(), body.clone());
@@ -347,6 +380,82 @@ async fn send(
         );
     }
     Ok(())
+}
+
+/// Stops an `ic3 typing` in `conv`, waiting out a signal in flight so none
+/// follows the post. A failure only costs a stray indicator: warn and go on.
+async fn stop_typing(session: &Session, conv: &ConversationId) {
+    let dir = typing::dir_for(&session.path);
+    let id = conv.0.clone();
+    match tokio::task::spawn_blocking(move || typing::stop(&dir, &id)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "cannot stop ic3 typing"),
+        Err(e) => tracing::warn!(error = %e, "cannot stop ic3 typing"),
+    }
+}
+
+async fn typing(session: &Session, id: String, max: Duration) -> anyhow::Result<()> {
+    let id = id.trim().to_owned();
+    if id.is_empty() {
+        bail!("the conversation id is empty");
+    }
+    let conv = ConversationId(id);
+    let mut sigint = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+    let marker = typing::Marker::claim(&typing::dir_for(&session.path), &conv.0)
+        .context("claiming the conversation for typing")?;
+    let result = tokio::select! {
+        r = typing_loop(session, &conv, &marker) => r,
+        _ = sigint.recv() => Ok(()),
+        _ = sigterm.recv() => Ok(()),
+        () = tokio::time::sleep(max) => Ok(()),
+    };
+    if let Err(e) = marker.release() {
+        tracing::warn!(error = %e, "cannot remove the typing marker");
+    }
+    result
+}
+
+/// How soon a failed typing signal is retried.
+const TYPING_RETRY: Duration = Duration::from_secs(5);
+/// How often the typer checks whether `send` or a newer typer stopped it.
+const TYPING_POLL: Duration = Duration::from_secs(1);
+
+async fn typing_loop(
+    session: &Session,
+    conv: &ConversationId,
+    marker: &typing::Marker,
+) -> anyhow::Result<()> {
+    let mut client = session.signed_in_client().await?;
+    let mut poll = tokio::time::interval(TYPING_POLL);
+    let mut next = tokio::time::Instant::now();
+    loop {
+        poll.tick().await;
+        // Held until the signal is sent, so `send` can't post in between.
+        let Some(guard) = marker.hold_if_current()? else {
+            client.shutdown().await;
+            return Ok(());
+        };
+        if tokio::time::Instant::now() < next {
+            continue;
+        }
+        match client.api().send_typing(conv).await {
+            Ok(()) => next = tokio::time::Instant::now() + ic3_teams::TYPING_REFRESH,
+            Err(ic3_teams::Error::ReauthRequired) => {
+                drop(guard);
+                client.shutdown().await;
+                if !session.store.changed().await? {
+                    return Err(SignedOut.into());
+                }
+                tracing::info!("session replaced by another ic3 process; carrying on with it");
+                client = session.signed_in_client().await?;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "typing signal failed; retrying");
+                next = tokio::time::Instant::now() + TYPING_RETRY;
+            }
+        }
+    }
 }
 
 /// Every id in `args`, each of which may hold several separated by commas.
@@ -570,6 +679,15 @@ mod tests {
     fn plain_keeps_markup_literal() {
         assert_eq!(body("*hi*", true).plain_text(), "*hi*");
         assert_eq!(body("*hi*", false).plain_text(), "hi");
+    }
+
+    #[test]
+    fn typing_parses_its_limit() {
+        let cli = Cli::try_parse_from(["ic3", "typing", "48:notes", "--for", "90s"]).unwrap();
+        assert!(matches!(cli.command, Cmd::Typing { max, .. } if max == Duration::from_secs(90)));
+        let cli = Cli::try_parse_from(["ic3", "typing", "48:notes"]).unwrap();
+        assert!(matches!(cli.command, Cmd::Typing { max, .. } if max == Duration::from_secs(300)));
+        assert!(Cli::try_parse_from(["ic3", "typing", "48:notes", "--for", "soon"]).is_err());
     }
 
     #[test]
